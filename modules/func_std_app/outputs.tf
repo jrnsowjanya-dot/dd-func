@@ -3,11 +3,11 @@ output "deployment_status" {
   value = {
     zip_file_info = jsondecode(shell_script.function_zip.output)
     deployments = {
-      for key, deployment in azapi_resource_action.zip_deploy : key => {
+      for key, deployment in shell_script.config_zip_deploy : key => {
         function_app_name = var.function_app_names[key]
-        function_app_id   = deployment.resource_id
-        status           = "deployed"
-        timestamp        = timestamp()
+        function_app_id   = var.function_app_ids[key]
+        status            = "deployed"
+        timestamp         = timestamp()
       }
     }
     app_settings_updated = {
