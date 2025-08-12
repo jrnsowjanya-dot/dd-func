@@ -30,6 +30,12 @@ resource "shell_script" "function_zip" {
   }
 }
 
+# Determine the path to the ZIP file used for deployment
+locals {
+  deployment_zip_name = jsondecode(shell_script.function_zip.output)["file_name_full"]
+  deployment_zip_path = var.deployment_zip_path != "" ? var.deployment_zip_path : "${path.module}/${local.deployment_zip_name}"
+}
+
 # Get storage account information for each function app
 data "azurerm_storage_account" "func_storage" {
   for_each            = var.storage_account_names
@@ -41,9 +47,9 @@ data "azurerm_storage_account" "func_storage" {
 resource "azurerm_storage_blob" "function_code_zip" {
   for_each = var.storage_account_names
 
-  name                   = jsondecode(shell_script.function_zip.output)["file_name_full"]
+  name                   = local.deployment_zip_name
   type                   = "Block"
-  source                 = "${path.module}/${jsondecode(shell_script.function_zip.output)["file_name_full"]}"
+  source                 = "${path.module}/${local.deployment_zip_name}"
   storage_account_name   = each.value
   storage_container_name = var.storage_container_name
   content_md5            = jsondecode(shell_script.function_zip.output)["md5"]
@@ -55,21 +61,27 @@ resource "azurerm_storage_blob" "function_code_zip" {
   depends_on = [shell_script.function_zip]
 }
 
-# Deploy ZIP file to Function Apps using Azure REST API
-resource "azapi_resource_action" "zip_deploy" {
+# Ensure function apps are provisioned before deployment
+data "azapi_resource" "function_app" {
   for_each    = var.function_app_ids
   type        = "Microsoft.Web/sites@2022-03-01"
   resource_id = each.value
+}
 
-  action = "zipdeploy"
-  method = "POST"
-  
-  # Use the ZIP file content for deployment
-  body = file("${path.module}/${jsondecode(shell_script.function_zip.output)["file_name_full"]}")
-  
+# Deploy ZIP file to Function Apps using Azure CLI
+resource "shell_script" "config_zip_deploy" {
+  for_each = var.function_app_names
+
+  lifecycle_commands {
+    create = <<-EOF
+      az functionapp deployment source config-zip --resource-group ${var.resource_group_name} --name ${each.value} --src ${local.deployment_zip_path}
+    EOF
+    delete = "echo 'No delete required'"
+  }
+
   depends_on = [
     shell_script.function_zip,
-    azurerm_storage_blob.function_code_zip
+    data.azapi_resource.function_app
   ]
 }
 
@@ -101,5 +113,5 @@ resource "azapi_update_resource" "function_app_settings" {
     )
   })
 
-  depends_on = [azapi_resource_action.zip_deploy]
+  depends_on = [shell_script.config_zip_deploy]
 }
