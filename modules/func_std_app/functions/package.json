@@ -1,0 +1,13 @@
+{
+    "name": "dd-log-forwarder",
+    "version": "1.0.0",
+    "description": "Azure Function that forwards Event Hub logs to Datadog",
+    "scripts": {
+      "start": "func start"
+    },
+    "dependencies": {
+      "azure-functions": "^1.10.0",
+      "axios": "^1.6.0"
+    }
+  }
+  
