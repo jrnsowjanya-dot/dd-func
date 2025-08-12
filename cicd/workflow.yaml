@@ -1,0 +1,98 @@
+trigger: none
+
+parameters:
+  - name: action
+    displayName: "Terraform Action (Plan only from Branch)"
+    type: string
+    default: plan
+    values:
+      - plan
+      - apply
+      - destroy
+      - refresh
+
+  - name: environment
+    displayName: Deployment environment
+    type: string
+    default: sandbox
+    values:
+      - sandbox
+      - live
+
+  - name: fail_on_plan_change
+    displayName: Fail the pipeline if running a plan shows infra changes
+    type: boolean
+    default: false
+
+resources:
+  repositories:
+    - repository: self
+      clean: true
+    - repository: terragrunt-ado-framework-repo
+      type: github
+      name: VF-DigitalEngineering-CloudEngineering/terragrunt-ado-framework
+      ref: feat/apply-from-branch #refs/tags/v5.4
+      endpoint: github-saas
+
+extends:
+  template: cicd/workflow.yaml@terragrunt-ado-framework-repo
+  parameters:
+    action: ${{ parameters.action }}
+    fail_on_plan_change: ${{ parameters.fail_on_plan_change }}
+    cloud_domain: ${{ parameters.environment }}
+    cloud_provider: azure
+    cluster_name_suffix: "uks-tooling"
+    configure_github_saas: false
+
+    # Note: Use the following if you're on 'Azure Pipelines' public agents for GitConfig
+    # use_private_agents: false
+    # configure_github_saas: true
+    # github_secret_service_connection: "cloud-engineering-master"
+    # github_secret_region: "eu-west-1"
+
+
+    job_definitions:
+      rbac:
+        jobs:
+          - name: Infra_1
+            list: "aks_users_rbac"
+
+      tooling:
+        jobs:
+          - name: Infra_1
+            list: "data_prereqs"
+            skipDestroy: true
+
+          - name: Infra_8
+            list: "obs_monitoring/functionapp"
+            dependsOnApply: Infra_1
+
+          - name: Infra_9
+            list: "obs_monitoring/dd_function"
+            dependsOnApply: Infra_8 
+
+    stages:
+      sandbox:
+        - name: vfcep
+          envs: ["sandbox"]
+          regions: ["uksouth"]
+          profile: "rbac"
+          apps: ["rbac"]
+        - name: vfcep
+          envs: ["sandbox"]
+          regions: ["uksouth"]
+          profile: "tooling"
+          apps: ["tooling"]
+      live:
+        - name: vfcep
+          # envs: ["prod", "non-prod"]
+          envs: ["non-prod"]
+          regions: ["uksouth"]
+          profile: "rbac"
+          apps: ["rbac"]
+        - name: vfcep
+          # envs: ["prod", "non-prod"]
+          envs: ["non-prod"]
+          regions: ["uksouth"]
+          profile: "tooling"
+          apps: ["tooling"]
