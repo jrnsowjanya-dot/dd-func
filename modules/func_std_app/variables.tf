@@ -38,3 +38,9 @@ variable "app_settings" {
   type        = map(map(string))
   default     = {}
 }
+
+variable "deployment_zip_path" {
+  description = "Optional path to a pre-created ZIP file for deployment"
+  type        = string
+  default     = ""
+}
