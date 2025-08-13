@@ -1,91 +1,90 @@
 locals {
-  # Directory and ZIP configuration
+  # Directory containing the function code and name of the zip package
   source_directory = "functions"
-  zip_name        = "logforwarder"
-  
-  # Calculate hash of all function files for change detection
-  source_hash = sha256(join("", [
-    for file in fileset("${path.module}/${local.source_directory}", "**/*") :
-    filesha256("${path.module}/${local.source_directory}/${file}")
-    if !contains(["*.zip", "*.log", "node_modules/**/*", ".git/**/*"], file)
-  ]))
-  
-  # Parse the deployment mapping
+  zip_name         = "logforwarder.zip"
+
+  # Decode function app to storage account mapping (kept for compatibility)
   function_app_deployments = jsondecode(var.function_app_deployments_json)
 }
 
-# Create ZIP file using shell script provider
-resource "shell_script" "function_zip" {
-  lifecycle_commands {
-    create = <<-EOF
-      cd ${path.module}/${local.source_directory}
-      zip -r ../${local.zip_name}.zip .
-      echo "{\"md5\": \"$(md5sum ../${local.zip_name}.zip | awk '{print $1}')\", \"file_name\": \"${local.zip_name}\", \"file_name_full\": \"${local.zip_name}.zip\", \"source_hash\": \"${local.source_hash}\"}"
-    EOF
-    delete = "rm -f ${path.module}/${local.zip_name}.zip"
-  }
-  
-  triggers = {
-    source_hash = local.source_hash
-  }
+######################################################################
+# Package the function code
+######################################################################
+
+# Create a ZIP archive from the local function directory. The archive
+# is recreated whenever the source files change, which avoids the need
+# for external null_resource triggers.
+data "archive_file" "function_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/${local.source_directory}"
+  output_path = "${path.module}/${local.zip_name}"
 }
 
-# Determine the path to the ZIP file used for deployment
-locals {
-  deployment_zip_name = jsondecode(shell_script.function_zip.output)["file_name_full"]
-  deployment_zip_path = var.deployment_zip_path != "" ? var.deployment_zip_path : "${path.module}/${local.deployment_zip_name}"
-}
+######################################################################
+# Upload ZIP package to all storage accounts
+######################################################################
 
-# Get storage account information for each function app
 data "azurerm_storage_account" "func_storage" {
   for_each            = var.storage_account_names
   name                = each.value
   resource_group_name = var.resource_group_name
 }
 
-# Upload ZIP to each function app's storage account
+# Upload the generated ZIP file to each storage account. The MD5 hash
+# ensures the blob is replaced when the archive changes.
 resource "azurerm_storage_blob" "function_code_zip" {
   for_each = var.storage_account_names
 
-  name                   = local.deployment_zip_name
+  name                   = local.zip_name
   type                   = "Block"
-  source                 = "${path.module}/${local.deployment_zip_name}"
+  source                 = data.archive_file.function_zip.output_path
   storage_account_name   = each.value
   storage_container_name = var.storage_container_name
-  content_md5            = jsondecode(shell_script.function_zip.output)["md5"]
-
-  lifecycle {
-    replace_triggered_by = [shell_script.function_zip]
-  }
-  
-  depends_on = [shell_script.function_zip]
+  # Use the MD5 produced by the archive_file data source to avoid
+  # relying on the zip's path at plan time.
+  content_md5            = data.archive_file.function_zip.output_md5
 }
 
-# Ensure function apps are provisioned before deployment
-data "azapi_resource" "function_app" {
-  for_each    = var.function_app_ids
-  type        = "Microsoft.Web/sites@2022-03-01"
-  resource_id = each.value
-}
+######################################################################
+# Generate SAS URLs for the uploaded packages
+######################################################################
 
-# Deploy ZIP file to Function Apps using Azure CLI
-resource "shell_script" "config_zip_deploy" {
-  for_each = var.function_app_names
+data "azurerm_storage_account_sas" "package_sas" {
+  for_each           = var.storage_account_names
+  connection_string  = data.azurerm_storage_account.func_storage[each.key].primary_connection_string
+  https_only         = true
 
-  lifecycle_commands {
-    create = <<-EOF
-      az functionapp deployment source config-zip --resource-group ${var.resource_group_name} --name ${each.value} --src ${local.deployment_zip_path}
-    EOF
-    delete = "echo 'No delete required'"
+  resource_types {
+    service   = "b"
+    container = "c"
+    object    = "o"
   }
 
-  depends_on = [
-    shell_script.function_zip,
-    data.azapi_resource.function_app
-  ]
+  services {
+    blob = "b"
+  }
+
+  start  = "2020-01-01"
+  expiry = "2030-01-01"
+
+  permissions {
+    read   = true
+    list   = true
+  }
 }
 
-# Update function app settings with custom app settings and proper runtime configuration
+locals {
+  # Construct SAS-protected URLs to the uploaded ZIP packages
+  run_from_package = {
+    for key, name in var.function_app_names :
+    key => "https://${var.storage_account_names[key]}.blob.core.windows.net/${var.storage_container_name}/${azurerm_storage_blob.function_code_zip[key].name}${data.azurerm_storage_account_sas.package_sas[key].sas}"
+  }
+}
+
+######################################################################
+# Update Function App settings to run from the uploaded package
+######################################################################
+
 resource "azapi_update_resource" "function_app_settings" {
   for_each    = var.function_app_ids
   type        = "Microsoft.Web/sites/config@2022-03-01"
@@ -94,24 +93,19 @@ resource "azapi_update_resource" "function_app_settings" {
   body = jsonencode({
     properties = merge(
       {
-        # Core Function App settings
         FUNCTIONS_EXTENSION_VERSION     = "~4"
         FUNCTIONS_WORKER_RUNTIME        = "node"
         WEBSITE_NODE_DEFAULT_VERSION    = "~18"
-        
-        # Storage settings
-        AzureWebJobsStorage = "DefaultEndpointsProtocol=https;AccountName=${var.storage_account_names[each.key]};AccountKey=${data.azurerm_storage_account.func_storage[each.key].primary_access_key};"
-        
-        # Performance and deployment settings
-        WEBSITE_RUN_FROM_PACKAGE        = "0"
+        AzureWebJobsStorage             = "DefaultEndpointsProtocol=https;AccountName=${var.storage_account_names[each.key]};AccountKey=${data.azurerm_storage_account.func_storage[each.key].primary_access_key};"
+        WEBSITE_RUN_FROM_PACKAGE        = local.run_from_package[each.key]
         WEBSITE_ENABLE_SYNC_UPDATE_SITE = "true"
         WEBSITE_CONTENTAZUREFILECONNECTIONSTRING = "DefaultEndpointsProtocol=https;AccountName=${var.storage_account_names[each.key]};AccountKey=${data.azurerm_storage_account.func_storage[each.key].primary_access_key};"
         WEBSITE_CONTENTSHARE           = "${var.function_app_names[each.key]}-content"
+        BlobConnection__serviceUri     = "https://${var.storage_account_names[each.key]}.blob.core.windows.net"
+        BlobConnection__credential     = "managedidentity"
       },
-      # Merge with custom app settings passed from Terragrunt
       lookup(var.app_settings, each.key, {})
     )
   })
-
-  depends_on = [shell_script.config_zip_deploy]
 }
+
