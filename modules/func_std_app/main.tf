@@ -17,7 +17,9 @@ locals {
 data "archive_file" "function_zip" {
   type        = "zip"
   source_dir  = "${path.module}/${local.source_directory}"
-  output_path = "${path.module}/${local.zip_name}"
+  # Use an absolute path so downstream resources can reliably locate the
+  # generated archive regardless of the working directory Terraform runs from.
+  output_path = abspath("${path.module}/${local.zip_name}")
 }
 
 ######################################################################
